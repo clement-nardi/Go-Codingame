@@ -248,7 +248,7 @@ func (s *State) nextState(myTarget Coord) (next *State) {
 	if count%500 == 0 {
 		elapsed := time.Since(begin)
 		//fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
-		if elapsed > 95*time.Millisecond {
+		if elapsed > 105*time.Millisecond {
 			timeout = true
 		}
 	}
@@ -279,11 +279,12 @@ func (s *State) isBetterThan(other *State) bool {
 		adtb1, adtb2 := s.zombies.averageDistanceToBarycenter(), other.zombies.averageDistanceToBarycenter()
 		//fmt.Fprintf(os.Stderr,"adbt: %v vs %v\n", adtb1, adtb2)
 		if adtb1 == adtb2 {
+			mdtb1, mdtb2 := distance(s.aliveHumans[0].pos, s.zombies.barycenter()), distance(other.aliveHumans[0].pos, other.zombies.barycenter())
 			//fmt.Fprintf(os.Stderr,"turn: %v vs %v\n", s.turn, other.turn)
-			if s.turn == other.turn {
-				return distance(s.aliveHumans[0].pos, s.zombies.barycenter()) < distance(other.aliveHumans[0].pos, other.zombies.barycenter())
-			} else {
+			if mdtb1 == mdtb2 {
 				return s.turn < other.turn
+			} else {
+				return mdtb1 < mdtb2
 			}
 		} else {
 			return adtb1 < adtb2
