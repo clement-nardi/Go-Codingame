@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"fmt"
 	"math"
 	"os"
+	"time"
 )
 
 /**
@@ -15,6 +17,7 @@ const width = 16000
 const height = 9000
 const sampling = 10
 const killRadius = 2000
+const maxZ = 100
 
 func Min(a, b int) int {
 	if a < b {
@@ -31,6 +34,8 @@ func Max(a, b int) int {
 		return b
 	}
 }
+
+var fibo [maxZ]int
 
 func deg2rad(deg float64) float64 {
 	return deg * (math.Pi / 180)
@@ -54,7 +59,7 @@ func (c Coord) coordAt(dist, angle float64) Coord {
 	res.y += int(math.Sin(deg2rad(angle)) * dist)
 	return res
 }
-func (in Coord) secure() (c Coord){
+func (in Coord) secure() (c Coord) {
 	c = in
 	if c.x < 0 {
 		c.x = 0
@@ -112,10 +117,18 @@ type State struct {
 	aliveHumans, deadHumans, zombies Bipeds
 	turn                             int
 	score                            int
+	previousState                    *State
 }
 
 func (s State) String() string {
-	return fmt.Sprintf("H=%v Z=%v s=%v", len(s.aliveHumans), len(s.zombies), s.score)
+	return fmt.Sprintf("H=%v Z=%v s=%v me=%v pot=%v adbt=%v turn=%v",
+		len(s.aliveHumans),
+		len(s.zombies),
+		s.score,
+		s.aliveHumans[0].pos,
+		s.scorePotential(),
+		s.zombies.averageDistanceToBarycenter(),
+		s.turn)
 }
 
 func (s State) hasWon() bool {
@@ -128,8 +141,9 @@ func (s State) isFinished() bool {
 	return s.hasLost() || s.hasWon()
 }
 
-func (s State) copyState() State {
-	var next State
+func (s *State) copyState() *State {
+	var next *State = new(State)
+	*next = *s
 
 	next.aliveHumans = make(Bipeds, len(s.aliveHumans))
 	next.deadHumans = make(Bipeds, len(s.deadHumans))
@@ -138,13 +152,49 @@ func (s State) copyState() State {
 	copy(next.aliveHumans, s.aliveHumans)
 	copy(next.deadHumans, s.deadHumans)
 	copy(next.zombies, s.zombies)
-	next.turn = s.turn
-	next.score = s.score
 
 	return next
 }
 
-func (s State) nextState(myTarget Coord) (next State) {
+func (s State) humanFactor() int {
+	nbOtherHumans := len(s.aliveHumans) - 1
+	return nbOtherHumans * nbOtherHumans * 10
+}
+
+func (s State) scorePotential() int {
+	return s.humanFactor() * fibo[len(s.zombies)]
+}
+
+func (bipeds Bipeds) barycenter() Coord {
+	var c Coord
+	for _, b := range bipeds {
+		c.x += b.pos.x
+		c.y += b.pos.y
+	}
+	l := len(bipeds)
+	if l > 0 {
+		c.x /= l
+		c.y /= l
+	}
+	return c
+}
+
+func (bipeds Bipeds) averageDistanceToBarycenter() float64 {
+	bary := bipeds.barycenter()
+	averageDist := 0.0
+	for _, b := range bipeds {
+		averageDist += distance(b.pos, bary)
+	}
+	l := len(bipeds)
+	if l > 0 {
+		averageDist /= float64(l)
+	}
+	return averageDist
+}
+
+var count int = 1
+
+func (s *State) nextState(myTarget Coord) (next *State) {
 
 	next = s.copyState()
 
@@ -160,9 +210,8 @@ func (s State) nextState(myTarget Coord) (next State) {
 
 	//I kill Zombies
 	nbZ := len(next.zombies)
-	nbOtherHumans := len(next.aliveHumans) - 1
-	humanFactor := nbOtherHumans * nbOtherHumans * 10
-	fibo1, fibo2 := 1, 1
+	humanFactor := next.humanFactor()
+	combo := 0
 	for i := 0; i < nbZ; i++ {
 		z := &next.zombies[i]
 		if distance(z.pos, me.pos) < 2000.0 {
@@ -170,8 +219,8 @@ func (s State) nextState(myTarget Coord) (next State) {
 			nbZ--
 			i--
 			//TODO compute score
-			next.score += humanFactor * fibo2
-			fibo1, fibo2 = fibo2, fibo1+fibo2
+			combo++
+			next.score += humanFactor * fibo[combo]
 		}
 	}
 	next.zombies = next.zombies[:nbZ]
@@ -193,6 +242,16 @@ func (s State) nextState(myTarget Coord) (next State) {
 	}
 
 	next.turn++
+	next.previousState = s
+
+	count++
+	if count%500 == 0 {
+		elapsed := time.Since(begin)
+		//fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
+		if elapsed > 95*time.Millisecond {
+			timeout = true
+		}
+	}
 
 	return
 }
@@ -209,6 +268,51 @@ func (bipeds Bipeds) closestFrom(position Coord) *Biped {
 		}
 	}
 	return closest
+}
+
+func (s *State) isBetterThan(other *State) bool {
+	//fmt.Fprintf(os.Stderr,"pot: %v vs %v\n", s.scorePotential(), other.scorePotential())
+	if s.hasWon() != other.hasWon() {
+		return s.hasWon()
+	}
+	if s.scorePotential() == other.scorePotential() {
+		adtb1, adtb2 := s.zombies.averageDistanceToBarycenter(), other.zombies.averageDistanceToBarycenter()
+		//fmt.Fprintf(os.Stderr,"adbt: %v vs %v\n", adtb1, adtb2)
+		if adtb1 == adtb2 {
+			//fmt.Fprintf(os.Stderr,"turn: %v vs %v\n", s.turn, other.turn)
+			if s.turn == other.turn {
+				return distance(s.aliveHumans[0].pos, s.zombies.barycenter()) < distance(other.aliveHumans[0].pos, other.zombies.barycenter())
+			} else {
+				return s.turn < other.turn
+			}
+		} else {
+			return adtb1 < adtb2
+		}
+	} else {
+		return s.scorePotential() > other.scorePotential()
+	}
+}
+
+type genHeap []*State
+
+func (h genHeap) Len() int { return len(h) }
+func (h genHeap) Less(i, j int) bool {
+	return h[i].isBetterThan(h[j])
+}
+func (h genHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *genHeap) Push(x interface{}) {
+	// Push and Pop use pointer receivers because they modify the slice's length,
+	// not just its contents.
+	*h = append(*h, x.(*State))
+}
+
+func (h *genHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
 type Field [width / sampling][height / sampling]int8
@@ -257,24 +361,52 @@ func (field *Field) String() string {
 
 var field *Field = new(Field)
 
-func (s State) evaluateBest() (dest Coord, maxScore int) {
-	maxScore = 0
-	for _, h := range s.aliveHumans {
-		//fmt.Fprintf(os.Stderr,"Try go to H%v\n", h.id)
+func (s *State) achievableScore() (winState *State, maxScore int) {
 
-		state := s.copyState()
-		for !state.isFinished() {
-			state = state.nextState(h.pos)
-			//fmt.Fprintln(os.Stderr,state)
-		}
-		if state.hasWon() {
-			if state.score > maxScore {
-				maxScore = state.score
-				dest = h.pos
+	if s.hasWon() {
+		maxScore = s.score
+		winState = s
+	} else {
+		maxScore = 0
+		for _, h := range s.aliveHumans {
+			//fmt.Fprintf(os.Stderr,"Try go to H%v\n", h.id)
+
+			state := s.copyState()
+			for !state.isFinished() {
+				state = state.nextState(h.pos)
+				//fmt.Fprintln(os.Stderr,state)
+			}
+			if state.hasWon() {
+				if state.score > maxScore {
+					maxScore = state.score
+					winState = state
+				}
 			}
 		}
 	}
 	return
+}
+
+var timeout bool
+var currentTurn int
+var begin time.Time
+
+func setTimeout() {
+	elapsed := time.Since(begin)
+	fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
+	timeout = true
+}
+
+func timeOutForTurn(turn int) {
+	time.Sleep(70 * time.Millisecond)
+	if turn == currentTurn {
+		timeout = true
+		//elapsed := time.Since(begin)
+		//fmt.Fprintf(os.Stderr,"elapsed: %v\n", elapsed)
+		//fmt.Fprintf(os.Stderr,"TIMEOUT[%v] !!!\n", turn)
+	} else {
+		fmt.Fprintf(os.Stderr, "timeout[%v] ...\n", turn)
+	}
 }
 
 func main() {
@@ -287,14 +419,24 @@ func main() {
 		}
 	}
 
-	var currentState State
+	//fill fibo
+	fibo[0] = 0
+	fibo[1] = 1
+	fibo[2] = 2
+	for i := 3; i < maxZ; i++ {
+		fibo[i] = fibo[i-1] + fibo[i-2]
+	}
+
+	var currentState *State = new(State)
 	currentState.turn = 0
 	currentState.score = 0
+	currentState.deadHumans = make([]Biped, 0)
 
 	for {
+		currentState.previousState = nil
 		currentState.aliveHumans = make([]Biped, 0)
-		currentState.deadHumans = make([]Biped, 0)
 		currentState.zombies = make([]Biped, 0)
+		currentTurn = currentState.turn
 
 		var x, y int
 		fmt.Scan(&x, &y)
@@ -328,7 +470,6 @@ func main() {
 			}
 		}
 
-
 		// fmt.Fprintln(os.Stderr, "Debug messages...")
 
 		/*
@@ -350,25 +491,65 @@ func main() {
 			//dest := zombies.closestFrom(me.pos).pos
 		*/
 
-		dest, maxScore := currentState.evaluateBest()
-		fmt.Fprintln(os.Stderr, currentState)
-		
-		
+		timeout = false
+		begin = time.Now()
+		//go timeOutForTurn(currentTurn)
+		//go time.AfterFunc(90*time.Millisecond, setTimeout)
 
-		for _, dist := range []float64{1002.0, 800.0, 600.0, 400.0} {
-			for angle := 0.0; angle < 360.0; angle += 360.0 / 16.0 {
-				nextPos := me.pos.coordAt(dist, angle).secure()
-				state := currentState.nextState(nextPos)
-				_,score := state.evaluateBest()
-				if score > maxScore {
-					maxScore = score
-					dest = nextPos
+		fmt.Fprintln(os.Stderr, currentState)
+
+		selectedState := currentState
+		maxState, maxScore := currentState.achievableScore()
+
+		states := make(genHeap, 0, 1000)
+		states.Push(currentState)
+		heap.Init(&states)
+
+		for len(states) > 0 {
+			workingState := heap.Pop(&states).(*State)
+			if !workingState.isFinished() { //don't expand finished states
+				//fmt.Fprint(os.Stderr,".")
+				//fmt.Fprintln(os.Stderr, workingState)
+
+				for _, dist := range []float64{1002.0, 800.0, 600.0, 400.0} {
+					for angle := 0.0; angle < 360.0; angle += 360.0 / 16.0 {
+						nextPos := me.pos.coordAt(dist, angle).secure()
+						state := workingState.nextState(nextPos)
+						winState, score := state.achievableScore()
+
+						if score > maxScore ||
+							(score == maxScore &&
+								state.isBetterThan(selectedState)) {
+							maxScore = score
+							maxState = winState
+							selectedState = state
+						}
+						heap.Push(&states, state)
+						if timeout {
+							break
+						}
+					}
+					if timeout {
+						break
+					}
+				}
+				if timeout {
+					elapsed := time.Since(begin)
+					fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
+					break
 				}
 			}
 		}
 
 		fmt.Fprintf(os.Stderr, "currentScore = %v\n", currentState.score)
 		fmt.Fprintf(os.Stderr, "maxScore     = %v\n", maxScore)
+
+		fmt.Fprintln(os.Stderr, maxState)
+		for maxState.previousState.previousState != nil {
+			maxState = maxState.previousState
+			//fmt.Fprintln(os.Stderr, maxState)
+		}
+		dest := maxState.aliveHumans[0].pos
 
 		fmt.Printf("%v %v\n", dest.x, dest.y) // Your destination coordinates
 
