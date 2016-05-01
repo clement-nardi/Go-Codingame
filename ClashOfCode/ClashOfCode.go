@@ -252,3 +252,16 @@ func main() {
     M:=N%len(word)    
     fmt.Println(word[M:] + word[:M])
 }
+
+
+//Shortest Code: Suite
+package main
+import "fmt"
+func main() {var N,R,M int
+fmt.Scan(&N, &R)
+for i:=0;i<N;i++ {fmt.Print(M)
+M+=R
+if i<N-1 {fmt.Print(" ")}}}
+
+C: 
+main(){int N,R,i,O;scanf("%d%d",&N,&R);for (i=0;i<N;(i++)&(O+=R)) printf("%d%s",O,i<N-1?" ":"");}
