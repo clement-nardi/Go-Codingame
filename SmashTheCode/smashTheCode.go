@@ -207,26 +207,49 @@ func (g *Grid) lowestEmpty(col int) int {
 	return dropDepth
 }
 
-/* if count is nil: clear the adjacent cells of the same color
- * if count is not nil: count the adjacent cells of the same color */
-func (grid *Grid) fourWayExplore(row, col int, treated *Grid, count *int, mark byte) {
-	treated[row][col] = mark
-	around := [4][2]int{{1, 0}, {0, 1}, {-1, 0}, {0, -1}}
+func (g *Grid) CellAt(c Coord) byte {
+	return g[c.row][c.col]
+}
+
+func (g *Grid) ExplodeCellAt(c Coord) {
+	/* clear cell */
+	g.SetCellAt(c, empty)
+	/* clear adjacent skulls */
+	around := [4]Coord{Coord{1, 0}, Coord{0, 1}, Coord{-1, 0}, Coord{0, -1}}
 	for i := 0; i < 4; i++ {
-		row2, col2 := row+around[i][0], col+around[i][1]
-		if row2 >= 0 && col2 >= 0 && row2 < nbRows && col2 < nbCols {
-			if treated[row2][col2] == 0 && grid[row2][col2] == grid[row][col] {
-				grid.fourWayExplore(row2, col2, treated, count, mark)
-			}
-			if count == nil && isSkull(grid[row2][col2]) {
-				grid[row2][col2] = empty
+		c2 := c.Add(around[i])
+		if c2.isInGrid() {
+			if isSkull(g.CellAt(c2)) {
+				g.SetCellAt(c2, empty)
 			}
 		}
 	}
-	if count == nil {
-		grid[row][col] = empty
-	} else {
-		(*count)++
+}
+
+func (g *Grid) SetCellAt(c Coord, value byte) {
+	g[c.row][c.col] = value
+}
+
+func (c Coord) Add(c2 Coord) Coord {
+	return Coord{c.row + c2.row, c.col + c2.col}
+}
+
+func (c Coord) isInGrid() bool {
+	return c.row >= 0 && c.row < nbRows && c.col >= 0 && c.col < nbCols
+}
+
+/* builds the list of adjacent cells of the same color */
+func (grid *Grid) fourWayExplore(c Coord, treated *Grid, groupCells *[]Coord, mark byte) {
+	*groupCells = append(*groupCells, c)
+	treated.SetCellAt(c, mark)
+	around := [4]Coord{Coord{1, 0}, Coord{0, 1}, Coord{-1, 0}, Coord{0, -1}}
+	for i := 0; i < 4; i++ {
+		c2 := c.Add(around[i])
+		if c2.isInGrid() {
+			if treated.CellAt(c2) == 0 && grid.CellAt(c2) == grid.CellAt(c) {
+				grid.fourWayExplore(c2, treated, groupCells, mark)
+			}
+		}
 	}
 }
 
@@ -249,19 +272,22 @@ func (grid *Grid) isIdenticalExceptTopSkullsTo(other *Grid) bool {
 	return true
 }
 
-func (pa *PlayerArea) resolveAdjacents(dropHint *[2]Coord, iteration uint) {
+func (pa *PlayerArea) resolveAdjacents(dropCoords *[2]Coord, iteration uint) {
 	var treated Grid //0 = untreated
 
-	var bigGroups []BigGroup = make([]BigGroup, 0) //row,col,count
+	var bigGroups [][]Coord = make([][]Coord, 0, 4)
+	var smallGroups [][]Coord = make([][]Coord, 0, 10)
 	var mark byte = 'a'
 
-	if dropHint != nil {
-		for _, coord := range *dropHint {
-			count := 0
-			pa.grid.fourWayExplore(coord.row, coord.col, &treated, &count, mark)
+	if dropCoords != nil {
+		for _, drop := range dropCoords {
+			var group []Coord = make([]Coord, 0, 6)
+			pa.grid.fourWayExplore(drop, &treated, &group, mark)
 			mark++
-			if count >= 4 {
-				bigGroups = append(bigGroups, BigGroup{Coord{coord.row, coord.col}, count})
+			if len(group) >= 4 {
+				bigGroups = append(bigGroups, group)
+			} else {
+				smallGroups = append(smallGroups, group)
 			}
 		}
 	} else {
@@ -269,11 +295,13 @@ func (pa *PlayerArea) resolveAdjacents(dropHint *[2]Coord, iteration uint) {
 		for col := 0; col < nbCols; col++ {
 			for row := nbRows - 1; row >= 0 && !isEmpty(pa.grid[row][col]); row-- {
 				if treated[row][col] == 0 && isColor(pa.grid[row][col]) {
-					count := 0
-					pa.grid.fourWayExplore(row, col, &treated, &count, mark)
+					var group []Coord = make([]Coord, 0, 6)
+					pa.grid.fourWayExplore(Coord{row, col}, &treated, &group, mark)
 					mark++
-					if count >= 4 {
-						bigGroups = append(bigGroups, BigGroup{Coord{row, col}, count})
+					if len(group) >= 4 {
+						bigGroups = append(bigGroups, group)
+					} else {
+						smallGroups = append(smallGroups, group)
 					}
 				}
 			}
@@ -297,27 +325,28 @@ func (pa *PlayerArea) resolveAdjacents(dropHint *[2]Coord, iteration uint) {
 
 	if len(bigGroups) > 0 {
 		/* now clear the cells from big groups */
-		var treated2 Grid //0 = untreated
-		B := 0            /* Blocks cleared */
-		CP := 0           /* Chain Power */
-		CB := 0           /* Color Bonus */
-		GB := 0           /* Group Bonus */
+		B := 0  /* Blocks cleared */
+		CP := 0 /* Chain Power */
+		CB := 0 /* Color Bonus */
+		GB := 0 /* Group Bonus */
 		if iteration > 0 {
 			CP = 1 << (iteration + 2) // 8, 16, 32, etc. 32 not observed
 		}
 		var colorCleared [6]bool
-		for i := 0; i < len(bigGroups); i++ {
-			colorCleared[pa.grid[bigGroups[i].coord.row][bigGroups[i].coord.col]-'0'] = true
-			pa.grid.fourWayExplore(bigGroups[i].coord.row, bigGroups[i].coord.col, &treated2, nil, 1)
-			B += bigGroups[i].count /* number of blocks cleared, without skulls */
-			if bigGroups[i].count >= 11 {
+		for _, group := range bigGroups {
+			colorCleared[pa.grid.CellAt(group[0])-'0'] = true
+			for _, coord := range group {
+				pa.grid.ExplodeCellAt(coord)
+			}
+			B += len(group) /* number of blocks cleared, without skulls */
+			if B >= 11 {
 				GB += 8
 			} else {
-				GB += bigGroups[i].count - 4
+				GB += B - 4
 			}
 		}
 		nbColorCleared := 0
-		for i := 1; i < 6; i++ {
+		for i := 1; i < 6; i++ { //0 is not a color
 			if colorCleared[i] {
 				nbColorCleared++
 			}
@@ -365,88 +394,14 @@ func (pa *PlayerArea) resolveAdjacents(dropHint *[2]Coord, iteration uint) {
 		}
 		/* recursively test for new adjacent colors */
 		pa.resolveAdjacents(nil, iteration+1)
-	}
-}
-
-func (pa *PlayerArea) computePotential() {
-	potential := 0
-
-	for col := 0; col < nbCols; col++ {
-		/* 2 points per vertically adjacent cells with same color */
-		for row := nbRows - 2; row >= 0; row-- {
-			currentCell := pa.grid[row][col]
-			if isEmpty(currentCell) {
-				break
-			}
-			if isColor(currentCell) {
-				belowCell := pa.grid[row+1][col]
-				if currentCell == belowCell {
-					potential += 2
-					if row < nbRows-2 {
-						if currentCell == pa.grid[row+2][col] {
-							/* vertical alignment of 3 cells of same color: +2 (total = 6) */
-							potential += 2
-						}
-					}
-				}
-			}
-		}
-
-		/* 1 point per vertical groups of same color separated by only one color
-		 * (ignore skulls for now) */
-		var colorStack [nbRows]byte
-		nbColors := 0
-		for row := nbRows - 1; row >= 0; row-- {
-			currentCell := pa.grid[row][col]
-			if isEmpty(currentCell) {
-				break
-			}
-			if isColor(currentCell) {
-				if nbColors == 0 || currentCell != colorStack[nbColors-1] {
-					colorStack[nbColors] = currentCell
-					nbColors++
-					if nbColors >= 2 && currentCell == colorStack[nbColors-2] {
-						potential++
-					}
-				}
-			}
+	} else {
+		/* there are no cells to clear, evaluate the potential of this grid */
+		pa.potential = 0
+		for _, group := range smallGroups {
+			groupSizeBonus := [4]int{0, 0, 2, 5} // 2 point for 2 adjacent cells, 5 points for 3 adjacent cells
+			pa.potential += groupSizeBonus[len(group)]
 		}
 	}
-
-	/* 2 points per horizontally adjacent cells with same color */
-	for col := 0; col < nbCols-1; col++ {
-		for row := nbRows - 1; row >= 0; row-- {
-			currentCell := pa.grid[row][col]
-			if isEmpty(currentCell) {
-				break
-			}
-			if isColor(currentCell) {
-				belowCell := pa.grid[row][col+1]
-				if currentCell == belowCell {
-					potential += 2
-				}
-			}
-		}
-	}
-	/* 1 points per diagonals (except against edges) */
-	for col := 1; col < nbCols-1; col++ {
-		for row := nbRows - 2; row >= 0; row-- {
-			currentCell := pa.grid[row][col]
-			if isEmpty(currentCell) {
-				break
-			}
-			if isColor(currentCell) {
-				if currentCell == pa.grid[row+1][col-1] {
-					potential++
-				}
-				if currentCell == pa.grid[row+1][col+1] {
-					potential++
-				}
-			}
-		}
-	}
-
-	pa.potential = potential
 }
 
 /* n >= 1 */
@@ -535,13 +490,12 @@ func (s *State) nextState(col, rot int) *State {
 	next.area.grid[coords[0].row][coords[0].col] = currentGameArea().nextPairs[next.step][0]
 	next.area.grid[coords[1].row][coords[1].col] = currentGameArea().nextPairs[next.step][1]
 
-	next.area.resolveAdjacents(&coords, 0)
+	next.area.resolveAdjacents(nil, 0) // will compute the potential
 
 	next.step++
 	next.area.dropCol = col
 	next.area.dropRotation = rot
 	next.previous = s
-	next.area.computePotential()
 
 	if countNextState%500 == 0 {
 		elapsed := time.Since(begin)
