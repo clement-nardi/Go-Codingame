@@ -673,7 +673,7 @@ func (s *State) nextState(col, rot int) *State {
 	next.previous = s
 	next.area.computePotential()
 
-	if countNextState%500 == 0 {
+	if countNextState%200 == 0 {
 		elapsed := time.Since(begin)
 		//fmt.Fprintf(os.Stderr, "elapsed: %v countNextState=%v \n", elapsed, countNextState)
 		if elapsed > 90*time.Millisecond {
@@ -691,6 +691,13 @@ func Min(a, b int) int {
 		return b
 	}
 }
+func Max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
 
 func (s *State) isBetterThan(other *State) bool {
 	score1 := s.area.score
@@ -702,18 +709,11 @@ func (s *State) isBetterThan(other *State) bool {
 			return score1 > score2
 		}
 	} else {
-		if score1 > 0 && score2 > 0 {
-			crit1 := Min(score1, minAddScoreToWin) - 70*nbCols*s.step
-			crit2 := Min(score2, minAddScoreToWin) - 70*nbCols*other.step
-			if crit1 != crit2 {
-				return crit1 > crit2
-			} else {
-				return s.area.potential > other.area.potential
-			}
-		} else if score1 != score2 {
-			return score1 > score2
+		crit1 := Max(0, Min(score1, minAddScoreToWin)-120*s.step)
+		crit2 := Max(0, Min(score2, minAddScoreToWin)-120*other.step)
+		if crit1 != crit2 {
+			return crit1 > crit2
 		} else {
-			/* both scores are 0 */
 			return s.area.potential > other.area.potential
 		}
 	}
@@ -837,7 +837,7 @@ func main() {
 		solutionCol := nextState.area.dropCol
 		solutionRot := nextState.area.dropRotation
 
-		debug = true
+		debug = false
 		if debug && solutionCol >= 0 {
 			bestState.getNthState(1).nextState(solutionCol, solutionRot)
 		}
@@ -860,9 +860,7 @@ func main() {
 		} else if addScore > 0 {
 			text = " Pan!"
 		} else {
-			if bestState.getNthState(3).area.score > nextState.area.score {
-				text = " Wait for it..."
-			}
+			text = fmt.Sprintf(" %v %v", bestState.area.score, bestState.step-1)
 		}
 
 		fmt.Printf("%v %v%s\n", solutionCol, solutionRot, text) // "x": the column in which to drop your blocks
