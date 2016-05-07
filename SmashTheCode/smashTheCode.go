@@ -63,6 +63,7 @@ var countNextState int
 var timeout bool
 var begin time.Time
 var debug bool
+var minAddScoreToWin int
 
 func currentGameArea() *GameArea {
 	return &gameHistory[currentRound]
@@ -122,7 +123,7 @@ func (s *State) Path() string {
 	state := s
 	nbSteps := 0
 	for state != nil {
-		grids[nbSteps] = strings.Split(fmt.Sprintf("%v/%v=%v\n", state.area.potential, state.step+1, state.potentialPerStep())+state.area.String(), "\n")
+		grids[nbSteps] = strings.Split(fmt.Sprintf("%v %v\n", state.area.potential, state.step+1)+state.area.String(), "\n")
 		state = state.previous
 		nbSteps++
 	}
@@ -272,6 +273,47 @@ func (grid *Grid) isIdenticalExceptTopSkullsTo(other *Grid) bool {
 	return true
 }
 
+func (grid *Grid) dropOneSkullLine() {
+	for col := 0; col < nbCols; col++ {
+		for row := nbRows - 1; row >= 0; row-- {
+			if isEmpty(grid[row][col]) {
+				grid[row][col] = skull
+				break
+			}
+		}
+	}
+}
+
+func (grid *Grid) willLooseForSure() bool {
+	largestEmptyArea := 0
+	maxPairsDropped := 0
+
+	var treated Grid
+
+	for col := 0; col < nbCols; col++ {
+		if treated[0][col] == 0 && isEmpty(grid[0][col]) {
+			var group []Coord = make([]Coord, 0, 6)
+			grid.fourWayExplore(Coord{0, col}, &treated, &group, 'x')
+			if len(group) >= largestEmptyArea {
+				largestEmptyArea = len(group)
+			}
+			/* can only fit 1 pair on 3 empty cells */
+			maxPairsDropped += len(group) / 2
+		}
+	}
+
+	if largestEmptyArea < 4 {
+		return true
+	}
+	if maxPairsDropped > nbPairsKnown {
+		return false
+	}
+
+	/* TODO: determine if the player can align 4 blocks of the same color
+	   with largestEmptyArea/2 pairs from the maxPairDropped next pairs */
+	return false
+}
+
 func (pa *PlayerArea) resolveAdjacents(dropCoords *[2]Coord, iteration uint) {
 	var treated Grid //0 = untreated
 
@@ -339,10 +381,10 @@ func (pa *PlayerArea) resolveAdjacents(dropCoords *[2]Coord, iteration uint) {
 				pa.grid.ExplodeCellAt(coord)
 			}
 			B += len(group) /* number of blocks cleared, without skulls */
-			if B >= 11 {
+			if len(group) >= 11 {
 				GB += 8
 			} else {
-				GB += B - 4
+				GB += len(group) - 4
 			}
 		}
 		nbColorCleared := 0
@@ -642,28 +684,43 @@ func (s *State) nextState(col, rot int) *State {
 	return next
 }
 
-func (s *State) potentialPerStep() int {
-	return s.area.potential / (s.step + 1)
+func Min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
 }
 
 func (s *State) isBetterThan(other *State) bool {
-	score1 := s.area.score / (s.step + 1)
-	score2 := other.area.score / (other.step + 1)
-	if score1 != score2 {
-		return score1 > score2
+	score1 := s.area.score
+	score2 := other.area.score
+	if score1 >= minAddScoreToWin && score2 >= minAddScoreToWin {
+		if s.step != other.step {
+			return s.step < other.step
+		} else {
+			return score1 > score2
+		}
+	} else {
+		if score1 > 0 && score2 > 0 {
+			crit1 := Min(score1, minAddScoreToWin) - 70*nbCols*s.step
+			crit2 := Min(score2, minAddScoreToWin) - 70*nbCols*other.step
+			if crit1 != crit2 {
+				return crit1 > crit2
+			} else {
+				return s.area.potential > other.area.potential
+			}
+		} else if score1 != score2 {
+			return score1 > score2
+		} else {
+			/* both scores are 0 */
+			return s.area.potential > other.area.potential
+		}
 	}
-	return s.hasMorePotentialPerStepThan(other)
 }
 
 func (s *State) hasToBeTreatedBefore(other *State) bool {
-	if s.step <= 2 { /* explore all 2-step combinations before going further */
-		return true
-	}
-	return s.hasMorePotentialPerStepThan(other)
-}
-
-func (s *State) hasMorePotentialPerStepThan(other *State) bool {
-	return s.potentialPerStep() > other.potentialPerStep()
+	return s.area.potential > other.area.potential
 }
 
 type genHeap []*State
@@ -709,42 +766,67 @@ func main() {
 			}
 		}
 
+		ennemyGrid := currentGameArea().playerArea[him].grid
+		nbSkullLines := 0
+
+		for !ennemyGrid.willLooseForSure() {
+			nbSkullLines++
+			ennemyGrid.dropOneSkullLine()
+		}
+
+		additionalNuisanceNeededToWin := nbSkullLines*nbCols - currentGameArea().nuisanceAfterSkullDropFrom(me)
+		minAddScoreToWin = additionalNuisanceNeededToWin * 70
+
+		fmt.Fprintf(os.Stderr, "minAddScoreToWin=%v\n", minAddScoreToWin)
 		//fmt.Fprintln(os.Stderr, currentGameArea())
 
-		var state *State = new(State)
-
-		state.area = currentGameArea().playerArea[me]
-		state.area.score = 0
+		var initialState *State = new(State)
+		initialState.area = currentGameArea().playerArea[me]
+		initialState.area.score = 0
 
 		//fmt.Fprintln(os.Stderr, state)
 
-		states := make(genHeap, 0, 1000)
-		states.Push(state)
-		heap.Init(&states)
+		var queues [nbPairsKnown + 1]genHeap
+
+		for i := 0; i < nbPairsKnown+1; i++ {
+			queues[i] = make(genHeap, 0, 1000)
+		}
+
+		queues[0].Push(initialState)
+
+		for i := 0; i < nbPairsKnown+1; i++ {
+			heap.Init(&queues[i])
+		}
 
 		var workingState *State
-		var bestState *State = state
+		var bestState *State = initialState
 
-		for len(states) > 0 {
-			//fmt.Fprintf(os.Stderr, "Pop %v\n", countPop)
-			workingState = heap.Pop(&states).(*State)
-			//fmt.Fprintln(os.Stderr, workingState)
-			nextStates := workingState.nextStates()
-			//fmt.Fprintf(os.Stderr, "next: %v\n", len(nextStates))
-			for _, nextState := range nextStates {
-				heap.Push(&states, nextState)
-				//fmt.Fprintf(os.Stderr, "Push\n")
-				if nextState.isBetterThan(bestState) {
-					bestState = nextState
+		minStep := 0
+
+		for minStep < nbPairsKnown+1 && !timeout {
+			for i := minStep; i < nbPairsKnown+1 && !timeout; i++ {
+				if len(queues[i]) == 0 {
+					if i == minStep {
+						minStep++
+					}
+					continue
+				}
+
+				workingState = heap.Pop(&queues[i]).(*State)
+				nextStates := workingState.nextStates()
+				for _, nextState := range nextStates {
+					if i < nbPairsKnown {
+						heap.Push(&queues[i+1], nextState)
+					}
+					if nextState.isBetterThan(bestState) {
+						bestState = nextState
+					}
 				}
 			}
-
-			if timeout {
-				elapsed := time.Since(begin)
-				fmt.Fprintf(os.Stderr, "elapsed: %v countNextState=%v\n", elapsed, countNextState)
-				break
-			}
 		}
+
+		elapsed := time.Since(begin)
+		fmt.Fprintf(os.Stderr, "elapsed: %v countNextState=%v\n", elapsed, countNextState)
 
 		fmt.Fprintln(os.Stderr, bestState.Path())
 		// fmt.Fprintln(os.Stderr, "Debug messages...")
@@ -755,7 +837,7 @@ func main() {
 		solutionCol := nextState.area.dropCol
 		solutionRot := nextState.area.dropRotation
 
-		debug = false
+		debug = true
 		if debug && solutionCol >= 0 {
 			bestState.getNthState(1).nextState(solutionCol, solutionRot)
 		}
@@ -767,7 +849,7 @@ func main() {
 			solutionRot = 0
 		}
 
-		addScore = nextState.area.score - state.area.score
+		addScore = nextState.area.score - initialState.area.score
 		var text string
 		if addScore > 2000 {
 			text = " vvvvvvvvvvvv ARMAGEDDON ^^^^^^^^^^^^"
