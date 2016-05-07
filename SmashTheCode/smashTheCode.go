@@ -394,14 +394,147 @@ func (pa *PlayerArea) resolveAdjacents(dropCoords *[2]Coord, iteration uint) {
 		}
 		/* recursively test for new adjacent colors */
 		pa.resolveAdjacents(nil, iteration+1)
-	} else {
-		/* there are no cells to clear, evaluate the potential of this grid */
-		pa.potential = 0
-		for _, group := range smallGroups {
-			groupSizeBonus := [4]int{0, 0, 2, 5} // 2 point for 2 adjacent cells, 5 points for 3 adjacent cells
-			pa.potential += groupSizeBonus[len(group)]
+	}
+}
+
+func (pa *PlayerArea) computePotential() {
+	potential := 0
+
+	for col := 0; col < nbCols; col++ {
+		/* 2 points per vertically adjacent cells with same color */
+		for row := nbRows - 2; row >= 0; row-- {
+			currentCell := pa.grid[row][col]
+			if isEmpty(currentCell) {
+				break
+			}
+			if isColor(currentCell) {
+				belowCell := pa.grid[row+1][col]
+				if currentCell == belowCell {
+					potential += 2
+					if row < nbRows-2 {
+						if currentCell == pa.grid[row+2][col] {
+							/* vertical alignment of 3 cells of same color: +2 (total = 6) */
+							potential += 2
+						}
+					}
+					if col > 0 {
+						if currentCell == pa.grid[row][col-1] ||
+							currentCell == pa.grid[row+1][col-1] {
+							/*  11       1  */
+							/*   1  or  11  */
+							potential += 2
+						}
+					}
+					if col < nbCols-1 {
+						if currentCell == pa.grid[row][col+1] ||
+							currentCell == pa.grid[row+1][col+1] {
+							/*  11      1   */
+							/*  1   or  11  */
+							potential += 2
+						}
+					}
+				}
+			}
+		}
+
+		/* 1 point per vertical groups of same color separated by only one color
+		 * (ignore skulls for now) */
+		//		var colorStack [nbRows]byte
+		//		nbColors := 0
+		//		for row := nbRows - 1; row >= 0; row-- {
+		//			currentCell := pa.grid[row][col]
+		//			if isEmpty(currentCell) {
+		//				break
+		//			}
+		//			if isColor(currentCell) {
+		//				if nbColors == 0 || currentCell != colorStack[nbColors-1] {
+		//					colorStack[nbColors] = currentCell
+		//					nbColors++
+		//					if nbColors >= 2 && currentCell == colorStack[nbColors-2] {
+		//						potential++
+		//					}
+		//				}
+		//			}
+		//		}
+
+		/* 1 point if two groups of the same color are in the same column */
+		var colorGroupCount [6]int
+		for row := nbRows - 1; row >= 0; row-- {
+			currentCell := pa.grid[row][col]
+			if isEmpty(currentCell) {
+				break
+			}
+			if isColor(currentCell) {
+				if row == nbRows-1 || currentCell != pa.grid[row+1][col] {
+					colorGroupCount[currentCell-'0']++
+					if colorGroupCount[currentCell-'0'] >= 2 {
+						potential += 1
+					}
+				}
+			}
+		}
+
+	}
+
+	/* 2 points per horizontally adjacent cells with same color */
+	for col := 0; col < nbCols-1; col++ {
+		for row := nbRows - 1; row >= 0; row-- {
+			currentCell := pa.grid[row][col]
+			if isEmpty(currentCell) {
+				break
+			}
+			if isColor(currentCell) {
+				rightCell := pa.grid[row][col+1]
+				if currentCell == rightCell {
+					potential += 2
+					if col < nbCols-2 && currentCell == pa.grid[row][col+2] {
+						/* 2 additional points for 3 horizontal cells */
+						potential += 2
+					}
+				}
+			}
 		}
 	}
+	/* 1 points per diagonals (except against edges) */
+	for col := 1; col < nbCols-1; col++ {
+		for row := nbRows - 2; row >= 0; row-- {
+			currentCell := pa.grid[row][col]
+			if isEmpty(currentCell) {
+				break
+			}
+			if isColor(currentCell) {
+				if currentCell == pa.grid[row+1][col-1] &&
+					currentCell != pa.grid[row][col-1] &&
+					currentCell != pa.grid[row+1][col] {
+					/* x1 */
+					/* 1x */
+					potential++
+				}
+				if currentCell == pa.grid[row+1][col+1] &&
+					currentCell != pa.grid[row+1][col] &&
+					currentCell != pa.grid[row][col+1] {
+					/* 1x */
+					/* x1 */
+					potential++
+				}
+			}
+		}
+	}
+
+	/* points if empty columns on the left */
+	for col := 0; col < nbCols; col++ {
+		row := nbRows - 1
+		for row >= 0 && isSkull(pa.grid[row][col]) {
+			row--
+		}
+		if row < 0 || isEmpty(pa.grid[row][col]) {
+			potential++
+		} else {
+			break
+		}
+	}
+
+	pa.potential = potential
 }
 
 /* n >= 1 */
@@ -490,12 +623,13 @@ func (s *State) nextState(col, rot int) *State {
 	next.area.grid[coords[0].row][coords[0].col] = currentGameArea().nextPairs[next.step][0]
 	next.area.grid[coords[1].row][coords[1].col] = currentGameArea().nextPairs[next.step][1]
 
-	next.area.resolveAdjacents(nil, 0) // will compute the potential
+	next.area.resolveAdjacents(&coords, 0) // will compute the potential
 
 	next.step++
 	next.area.dropCol = col
 	next.area.dropRotation = rot
 	next.previous = s
+	next.area.computePotential()
 
 	if countNextState%500 == 0 {
 		elapsed := time.Since(begin)
