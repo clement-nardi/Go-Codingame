@@ -56,6 +56,14 @@ type State struct {
 	previous *State
 }
 
+type Stat struct {
+	nbGenerated  int
+	nbExpanded   int
+	sumPotential uint64
+	sumScore     uint64
+	maxScore     int
+}
+
 /***** Global Variables *****/
 var gameHistory [maxRound]GameArea
 var currentRound int // starts at 0
@@ -64,9 +72,33 @@ var timeout bool
 var begin time.Time
 var debug bool
 var minAddScoreToWin int
+var minAcceptableAddScore int
 
 func currentGameArea() *GameArea {
 	return &gameHistory[currentRound]
+}
+
+func (s Stat) averagePotential() uint64 {
+	if s.nbGenerated != 0 {
+		return s.sumPotential / uint64(s.nbGenerated)
+	} else {
+		return 0
+	}
+}
+func (s Stat) averageScore() uint64 {
+	if s.nbGenerated != 0 {
+		return s.sumScore / uint64(s.nbGenerated)
+	} else {
+		return 0
+	}
+}
+func (s *Stat) update(state *State) {
+	s.nbGenerated++
+	s.sumPotential += uint64(state.area.potential)
+	s.sumScore += uint64(state.area.score)
+	if state.area.score > s.maxScore {
+		s.maxScore = state.area.score
+	}
 }
 
 func (g *Grid) acquire() {
@@ -312,6 +344,18 @@ func (grid *Grid) willLooseForSure() bool {
 	/* TODO: determine if the player can align 4 blocks of the same color
 	   with largestEmptyArea/2 pairs from the maxPairDropped next pairs */
 	return false
+}
+
+func (g *Grid) countEmpty() int {
+	count := 0
+	for col := 0; col < nbCols; col++ {
+		for row := nbRows - 1; row >= 0; row-- {
+			if isEmpty(g[row][col]) {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func (pa *PlayerArea) resolveAdjacents(dropCoords *[2]Coord, iteration uint) {
@@ -563,6 +607,20 @@ func (pa *PlayerArea) computePotential() {
 		}
 	}
 
+	cols := [nbCols]int{0, 5, 1, 4, 2, 3}
+	/* points if empty columns on the left */
+	for colpos := 0; colpos < nbCols; colpos++ {
+		col := cols[colpos]
+		row := nbRows - 1
+		for row >= 0 && isSkull(pa.grid[row][col]) {
+			row--
+		}
+		if row < 0 || isEmpty(pa.grid[row][col]) {
+			potential++
+		} else {
+			break
+		}
+	}
 	/* points if empty columns on the left */
 	for col := 0; col < nbCols; col++ {
 		row := nbRows - 1
@@ -702,19 +760,32 @@ func Max(a, b int) int {
 func (s *State) isBetterThan(other *State) bool {
 	score1 := s.area.score
 	score2 := other.area.score
-	if score1 >= minAddScoreToWin && score2 >= minAddScoreToWin {
+	targetScore := Min(minAddScoreToWin, 2600)
+	if score1 >= targetScore && score2 >= targetScore {
 		if s.step != other.step {
 			return s.step < other.step
 		} else {
+			//la classe ;)
 			return score1 > score2
 		}
-	} else {
-		crit1 := Max(0, Min(score1, minAddScoreToWin)-120*s.step)
-		crit2 := Max(0, Min(score2, minAddScoreToWin)-120*other.step)
+	} else if score1 >= minAcceptableAddScore && score2 >= minAcceptableAddScore && minAcceptableAddScore > 0 {
+		/* the two scores make at least one skull line
+		   choose the lowest score if it makes only 1 skull line in 1 less step,
+		   or 2 less skull lines in 2 less steps, etc. */
+		crit1 := Min(score1, targetScore) - 70*nbCols*s.step
+		crit2 := Min(score2, targetScore) - 70*nbCols*other.step
 		if crit1 != crit2 {
 			return crit1 > crit2
 		} else {
 			return s.area.potential > other.area.potential
+		}
+	} else if (score1 >= minAcceptableAddScore || score2 >= minAcceptableAddScore) && minAcceptableAddScore > 0 {
+		return score1 > score2
+	} else {
+		if s.area.potential != other.area.potential {
+			return s.area.potential > other.area.potential
+		} else {
+			return s.step > other.step
 		}
 	}
 }
@@ -776,8 +847,20 @@ func main() {
 
 		additionalNuisanceNeededToWin := nbSkullLines*nbCols - currentGameArea().nuisanceAfterSkullDropFrom(me)
 		minAddScoreToWin = additionalNuisanceNeededToWin * 70
+		minToSkull := 70*nbCols - currentGameArea().playerArea[me].score%(70*nbCols)
+
+		nbEmpty := currentGameArea().playerArea[me].grid.countEmpty()
+
+		if nbEmpty < 4*nbCols {
+			minAcceptableAddScore = 0
+		} else if nbEmpty < 6*nbCols {
+			minAcceptableAddScore = minToSkull
+		} else {
+			minAcceptableAddScore = minToSkull + 70*nbCols //2 skull lines
+		}
 
 		fmt.Fprintf(os.Stderr, "minAddScoreToWin=%v\n", minAddScoreToWin)
+		fmt.Fprintf(os.Stderr, "minAcceptableAddScore=%v\n", minAcceptableAddScore)
 		//fmt.Fprintln(os.Stderr, currentGameArea())
 
 		var initialState *State = new(State)
@@ -787,12 +870,14 @@ func main() {
 		//fmt.Fprintln(os.Stderr, state)
 
 		var queues [nbPairsKnown + 1]genHeap
+		var stats [nbPairsKnown + 1]Stat
 
 		for i := 0; i < nbPairsKnown+1; i++ {
 			queues[i] = make(genHeap, 0, 1000)
 		}
 
 		queues[0].Push(initialState)
+		stats[0].update(initialState)
 
 		for i := 0; i < nbPairsKnown+1; i++ {
 			heap.Init(&queues[i])
@@ -813,10 +898,12 @@ func main() {
 				}
 
 				workingState = heap.Pop(&queues[i]).(*State)
+				stats[i].nbExpanded++
 				nextStates := workingState.nextStates()
 				for _, nextState := range nextStates {
 					if i < nbPairsKnown {
 						heap.Push(&queues[i+1], nextState)
+						stats[i+1].update(nextState)
 					}
 					if nextState.isBetterThan(bestState) {
 						bestState = nextState
@@ -828,10 +915,12 @@ func main() {
 		elapsed := time.Since(begin)
 		fmt.Fprintf(os.Stderr, "elapsed: %v countNextState=%v\n", elapsed, countNextState)
 
+		// Stats
+		for i := 0; i < nbPairsKnown+1; i++ {
+			fmt.Fprintf(os.Stderr, "[%v] max=%v exp=%v/%v avpot=%v avscore=%v\n",
+				i, stats[i].maxScore, stats[i].nbExpanded, stats[i].nbGenerated, stats[i].averagePotential(), stats[i].averageScore())
+		}
 		fmt.Fprintln(os.Stderr, bestState.Path())
-		// fmt.Fprintln(os.Stderr, "Debug messages...")
-
-		/*fmt.Fprintln(os.Stderr, bestState.getNthState(1).areas[me])*/
 
 		nextState := bestState.getNthState(2)
 		solutionCol := nextState.area.dropCol
