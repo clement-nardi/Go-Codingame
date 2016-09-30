@@ -19,6 +19,9 @@ const (
 	nbCols               = 13
 	nbRows               = 11
 	box                  = '0'
+	boxWithExtraRange    = '1'
+	boxWithExtraBomb     = '2'
+	wall                 = 'X'
 	empty                = '.'
 	nbCardinalDirections = 4
 	bombTimer            = 8
@@ -87,10 +90,13 @@ func (g *Grid) acquire() {
 }
 
 func isBox(b byte) bool {
-	return b == box
+	return b >= box && b <= boxWithExtraBomb
 }
 func isEmpty(b byte) bool {
 	return b == empty
+}
+func isWall(b byte) bool {
+	return b == wall
 }
 
 func (l Line) String() string {
@@ -151,6 +157,14 @@ func (ga GameArea) HasBombAt(p Position) bool {
 	return false
 }
 
+func (ga GameArea) BombCanBeDroppedAt(p Position) bool {
+	return isEmpty(ga.grid.CellAt(p)) && !ga.HasBombAt(p)
+}
+
+func (ga GameArea) CanMoveTo(p Position) bool {
+	return ga.BombCanBeDroppedAt(p)
+}
+
 func (ga *GameArea) ExplodeBomb(bombIdx int) (brokenBoxes int) {
 	bomb := ga.bombs[bombIdx]
 	for _, boxPos := range ga.GetBoxesInRangeOf(bomb.Position, bomb.ownerID) {
@@ -172,8 +186,13 @@ func (ga GameArea) GetBoxesInRangeOf(p Position, playerIdx int) (boxes []Positio
 		for i := 0; i < ga.players[playerIdx].bombRange-1; i++ {
 			pos = Add(pos, v)
 			if pos.IsOnGrid() {
-				if isBox(ga.grid.CellAt(pos)) {
-					boxes = append(boxes, pos)
+				cell := ga.grid.CellAt(pos)
+				if !isWall(cell) {
+					if isBox(cell) {
+						boxes = append(boxes, pos)
+						break
+					}
+				} else {
 					break
 				}
 			} else {
@@ -222,7 +241,7 @@ func (ga GameArea) ReachableCellsFrom(p Position, maxDistance int) (cells [][]Po
 				pos := Add(prev, v)
 				if pos.IsOnGrid() && treated.CellAt(pos) == 0 { /* was not treated before */
 					treated.SetCellAt(pos, '0'+byte(i))
-					if isEmpty(ga.grid.CellAt(pos)) {
+					if ga.CanMoveTo(pos) {
 						cells[i] = append(cells[i], pos)
 					} else {
 						//treated.SetCellAt(pos, ' ')
@@ -278,16 +297,29 @@ func main() {
 		var bestDropPos Position
 		var bestScore int
 
+		var traceNbBoxes Grid
+		for i, row := range traceNbBoxes {
+			for j := range row {
+				traceNbBoxes[i][j] = ' '
+			}
+		}
+
 		for i := range reachable {
 			for _, pos := range reachable[i] {
-				cost := Max(minNbTurn, i) + 1
-				score := gameArea.NbBoxesInRangeOf(pos, me) * 1000 / cost
-				if score > bestScore {
-					bestScore = score
-					bestDropPos = pos
+				if gameArea.BombCanBeDroppedAt(pos) {
+					cost := Max(minNbTurn, i) + 1
+					nbBoxes := gameArea.NbBoxesInRangeOf(pos, me)
+					score := nbBoxes * 1000 / cost
+					if score > bestScore {
+						bestScore = score
+						bestDropPos = pos
+					}
+					traceNbBoxes.SetCellAt(pos, '0'+byte(nbBoxes))
 				}
 			}
 		}
+
+		fmt.Fprint(os.Stderr, traceNbBoxes)
 
 		// fmt.Fprintln(os.Stderr, "Debug messages...")
 		fmt.Printf("BOMB %v %v\n", bestDropPos.x, bestDropPos.y) // Write action to stdout
