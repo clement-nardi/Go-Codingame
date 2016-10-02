@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"fmt"
 	"os"
+	"runtime"
+	"time"
 )
 
 //import "os"
@@ -29,6 +32,9 @@ const (
 	itemExtraRange       = 1
 	itemExtraBomb        = 2
 	maxPlayers           = 4
+	move                 = 0
+	dropBomb             = 1
+	timeoutLimit         = 60
 )
 
 var cardinalVectors [nbCardinalDirections]Position = [nbCardinalDirections]Position{Position{0, 1}, Position{0, -1}, Position{1, 0}, Position{-1, 0}}
@@ -53,8 +59,9 @@ type Position struct {
 }
 
 func (p Position) String() string {
-	return fmt.Sprintf("%v %v", p.x, p.y)
+	return fmt.Sprintf("(%v,%v)", p.x, p.y)
 }
+
 func (p Position) IsOnGrid() bool {
 	return p.x >= 0 && p.x < nbCols && p.y >= 0 && p.y < nbRows
 }
@@ -63,14 +70,29 @@ func Add(a, b Position) Position {
 }
 
 type Player struct {
-	remainingBombs int
-	bombRange      int
-	isDead         bool
+	Position
+	remainingBombs  int
+	bombRange       int
+	isDead          bool
+	score           int
+	potential       int
+	scorePerTurn    int
+	potPerTurn      int
+	lastScoreUpdate int
+	lastPotUpdate   int
+}
+
+func (p Player) String() string {
+	return fmt.Sprintf("[s=%v d=%v nbb=%v rng=%v]", p.score, p.isDead, p.remainingBombs, p.bombRange)
 }
 
 type Bomb struct {
 	Position
 	ownerID int
+}
+
+func (b Bomb) String() string {
+	return fmt.Sprintf("%v:%v", b.ownerID, b.Position)
 }
 
 type Cell int16
@@ -113,7 +135,12 @@ const (
 	bombBits         = 017
 	playerBits       = 07400
 	itemBits         = 030000
+	inflamableBits   = 037757
 )
+
+func (c *Cell) Burn() {
+	*c &^= inflamableBits
+}
 
 func (c *Cell) SetBomb(playerId int) {
 	switch playerId {
@@ -199,7 +226,8 @@ func (c Cell) isEmpty() bool {
 	return c == 0
 }
 func (c Cell) CanReceiveBombNow() bool {
-	return c.isEmpty()
+	//assumes that player is on the cell
+	return !c.isBomb()
 }
 func (c Cell) isAccessible() bool {
 	return (c & inaccessibleBits) == 0
@@ -227,44 +255,36 @@ func (c Cell) getItemType() int {
 	}
 	return itemNone
 }
-func (c Cell) getPlayerIds() (nbPlayers int, playerIds [maxPlayers]int) {
+func (c Cell) getPlayerIds() (playerIds []int) {
 	if (c & player0Bit) > 0 {
-		playerIds[nbPlayers] = 0
-		nbPlayers++
+		playerIds = append(playerIds, 0)
 	}
 	if (c & player1Bit) > 0 {
-		playerIds[nbPlayers] = 1
-		nbPlayers++
+		playerIds = append(playerIds, 1)
 	}
 	if (c & player2Bit) > 0 {
-		playerIds[nbPlayers] = 2
-		nbPlayers++
+		playerIds = append(playerIds, 2)
 	}
 	if (c & player3Bit) > 0 {
-		playerIds[nbPlayers] = 3
-		nbPlayers++
+		playerIds = append(playerIds, 3)
 	}
 	//fmt.Fprintf(os.Stderr, "nbPlayers=%v\n", nbPlayers)
 	return
 }
-func (c Cell) getBombPlayerIds() (nbPlayers int, playerIds [maxPlayers]int) {
+func (c Cell) getBombPlayerIds() (playerIds []int) {
 	if (c & bombPlayer0Bit) > 0 {
-		playerIds[nbPlayers] = 0
-		nbPlayers++
+		playerIds = append(playerIds, 0)
 	}
 	if (c & bombPlayer1Bit) > 0 {
-		playerIds[nbPlayers] = 1
-		nbPlayers++
+		playerIds = append(playerIds, 1)
 	}
 	if (c & bombPlayer2Bit) > 0 {
-		playerIds[nbPlayers] = 2
-		nbPlayers++
+		playerIds = append(playerIds, 2)
 	}
 	if (c & bombPlayer3Bit) > 0 {
-		playerIds[nbPlayers] = 3
-		nbPlayers++
+		playerIds = append(playerIds, 3)
 	}
-	//fmt.Fprintf(os.Stderr, "nbPlayers=%v\n", nbPlayers)
+	//fmt.Fprintf(os.Stderr, "nbPlayers=%v\n", len(playerIds))
 	return
 }
 
@@ -292,11 +312,10 @@ func (g *Grid) acquire() {
 
 func (cell Cell) String() string {
 	//fmt.Fprintf(os.Stderr, "raw: %o\n", int16(cell))
-
 	if cell.isEmpty() {
 		return " "
 	} else if cell.isWall() {
-		return "."
+		return "+"
 	} else if cell.isBox() {
 		switch cell.getItemType() {
 		case itemNone:
@@ -314,10 +333,10 @@ func (cell Cell) String() string {
 			return "m"
 		}
 	} else if cell.isBomb() {
-		_, ids := cell.getBombPlayerIds()
+		ids := cell.getBombPlayerIds()
 		return string('a' + byte(ids[0]))
 	} else if cell.isPlayer() {
-		_, ids := cell.getPlayerIds()
+		ids := cell.getPlayerIds()
 		return string('A' + byte(ids[0]))
 	}
 	return "?"
@@ -342,13 +361,28 @@ func (g *Grid) CellAt(p Position) *Cell {
 	return &(g[p.y][p.x])
 }
 
+type Action struct {
+	action int
+	pos    Position
+}
+
+func (a Action) String() string {
+	var actionString string
+	if a.action == dropBomb {
+		actionString = "BOMB"
+	} else {
+		actionString = "MOVE"
+	}
+	return fmt.Sprintf("%v %v %v", actionString, a.pos.x, a.pos.y)
+}
+
 type GameArea struct {
-	grid Grid
-
-	droppedBombs []Bomb
-	players      [maxPlayers]Player
-
-	previous *GameArea
+	grid            Grid
+	droppedBombs    []Bomb
+	players         [maxPlayers]Player
+	actionToGetHere Action
+	turn            int
+	previous        *GameArea
 }
 
 func (ga *GameArea) acquire() {
@@ -365,7 +399,7 @@ func (ga *GameArea) acquire() {
 		pos := Position{x, y}
 		switch entityType {
 		case playerEntity:
-			ga.players[owner] = Player{param1, param2, false}
+			ga.players[owner] = Player{pos, param1, param2, false, 0, 0, 0, 0, 0, 0}
 			ga.grid.CellAt(pos).SetPlayer(owner)
 		case bombEntity:
 			ga.grid.CellAt(pos).SetBomb(owner)
@@ -407,6 +441,203 @@ func (ga *GameArea) GetBoxesInRangeOf(p Position, playerIdx int) (boxes []Positi
 	return
 }
 
+func (ga *GameArea) Get8TurnsAgo() *GameArea {
+	loopGA := ga
+	for i := 0; i < bombTimer; i++ {
+		loopGA = loopGA.previous
+		if loopGA == nil {
+			//fmt.Fprintf(os.Stderr, "Only %v turns\n", i)
+			return nil
+		}
+	}
+	return loopGA
+}
+
+func (ga *GameArea) ExplodeTimedOutBombs() (burnedCells map[Position]bool) {
+	ga8Ago := ga.Get8TurnsAgo()
+
+	if ga8Ago == nil {
+		return
+	}
+
+	var bombsToExplode []Bomb = make([]Bomb, 0)
+
+	for _, bomb := range ga8Ago.droppedBombs {
+		//make sure it didn't explode prematurily
+		exploded := false
+		loopGA := ga
+		for i := 0; i < bombTimer; i++ {
+			if !loopGA.grid.CellAt(bomb.Position).isBomb() {
+				exploded = true
+				break
+			}
+			loopGA = loopGA.previous
+		}
+		if !exploded {
+			bombsToExplode = append(bombsToExplode, bomb)
+		}
+	}
+
+	//fmt.Fprintf(os.Stderr, "Bombs to explode: %v\n", bombsToExplode)
+
+	var cellsToBurn map[Position]bool = make(map[Position]bool)
+	burnedCells = make(map[Position]bool)
+	savedPlayers := ga.players
+
+	for len(bombsToExplode) > 0 {
+		countBombExploded++
+		if countBombExploded%100 == 0 {
+			elapsed := time.Since(begin)
+			//fmt.Fprintf(os.Stderr, "b-elapsed: %v\n", elapsed)
+			if elapsed > timeoutLimit*time.Millisecond {
+				timeout = true
+				fmt.Fprintf(os.Stderr, "b-elapsed: %v\n", elapsed)
+			}
+		}
+
+		bomb := bombsToExplode[0]
+		bombrange := ga8Ago.players[bomb.ownerID].bombRange
+
+		ga.grid.CellAt(bomb.Position).ResetBomb(bomb.ownerID)
+		ga.players[bomb.ownerID].remainingBombs++
+		bombsToExplode = bombsToExplode[1:]
+		cellsToBurn[bomb.Position] = true
+		burnedCells[bomb.Position] = true
+
+		for _, direction := range cardinalVectors {
+			pos := bomb.Position
+			for i := 1; i < bombrange; i++ {
+				pos = Add(pos, direction)
+				if !pos.IsOnGrid() {
+					break
+				}
+				burnedCells[pos] = true
+				if !ga.grid.CellAt(pos).isEmpty() {
+					cellsToBurn[pos] = true
+					if ga.grid.CellAt(pos).isBomb() {
+						for _, id := range ga.grid.CellAt(pos).getBombPlayerIds() {
+							bombsToExplode = append(bombsToExplode, Bomb{pos, id})
+						}
+					}
+					if ga.grid.CellAt(pos).isBox() {
+						ga.players[bomb.ownerID].score++
+					}
+					break
+				}
+			}
+		}
+	}
+
+	for pidx := range ga.players {
+		if ga.players[pidx].score != savedPlayers[pidx].score {
+			ga.players[pidx].scorePerTurn += (ga.players[pidx].score - savedPlayers[pidx].score) * 1000 / (ga.turn - savedPlayers[pidx].lastScoreUpdate + 1)
+			ga.players[pidx].lastScoreUpdate = ga.turn
+		}
+	}
+
+	for pos := range cellsToBurn {
+		ga.BurnCellAt(pos)
+	}
+
+	//if len(burnedCells) > 0 {
+	//	fmt.Fprintf(os.Stderr, "BurnedCells=%v\n", burnedCells)
+	//}
+
+	return
+}
+
+func (ga *GameArea) BurnCellAt(pos Position) {
+	for id := range ga.grid.CellAt(pos).getPlayerIds() {
+		ga.players[id].isDead = true
+	}
+
+	itemDropped := itemNone
+	if ga.grid.CellAt(pos).isBox() {
+		itemDropped = ga.grid.CellAt(pos).getItemType()
+	}
+
+	ga.grid.CellAt(pos).Burn()
+
+	ga.grid.CellAt(pos).SetItem(itemDropped)
+}
+
+func (ga *GameArea) GetNextStates(playerId int) (nextStates []*GameArea) {
+
+	nbLoops := 1
+	oPos := ga.players[playerId].Position
+
+	if ga.players[playerId].remainingBombs > 0 && ga.grid.CellAt(oPos).CanReceiveBombNow() {
+		nbLoops = 2
+	}
+
+	nextStateBase := *ga
+	nextStateBase.turn++
+	nextStateBase.previous = ga
+	nextStateBase.ExplodeTimedOutBombs()
+
+	nextnext := nextStateBase
+	nextnext.previous = &nextStateBase
+	forbiddenCells := nextnext.ExplodeTimedOutBombs()
+
+	for i := 0; i < nbLoops; i++ {
+		for dir := 0; dir < nbCardinalDirections+1; dir++ {
+			pos := oPos
+			if dir < nbCardinalDirections {
+				pos = Add(pos, cardinalVectors[dir])
+			} else {
+				// stay there
+			}
+			if pos.IsOnGrid() && nextStateBase.grid.CellAt(pos).isAccessible() && !forbiddenCells[pos] {
+				nextState := new(GameArea)
+				*nextState = nextStateBase
+
+				if i > 0 {
+					nextState.DropBomb(playerId)
+					nextState.actionToGetHere.action = dropBomb
+					nextState.players[playerId].potential += nextState.NbBoxesInRangeOf(pos, playerId)
+					nextState.players[playerId].potPerTurn += nextState.NbBoxesInRangeOf(pos, playerId) * 1000 / (nextState.turn - nextState.players[playerId].lastPotUpdate + 1)
+				}
+				nextState.MovePlayer(playerId, pos)
+				nextState.actionToGetHere.pos = pos
+
+				nextStates = append(nextStates, nextState)
+
+				countGeneratedStates++
+				if countGeneratedStates%100 == 0 {
+					elapsed := time.Since(begin)
+					//fmt.Fprintf(os.Stderr, "g-elapsed: %v\n", elapsed)
+					if elapsed > timeoutLimit*time.Millisecond {
+						timeout = true
+						fmt.Fprintf(os.Stderr, "g-elapsed: %v\n", elapsed)
+					}
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func (ga *GameArea) DropBomb(playerId int) {
+	pos := ga.players[playerId].Position
+	ga.droppedBombs = append(ga.droppedBombs, Bomb{pos, playerId})
+	ga.grid.CellAt(pos).SetBomb(playerId)
+}
+
+func (ga *GameArea) MovePlayer(playerId int, target Position) {
+	ga.grid.CellAt(ga.players[playerId].Position).ResetPlayer(playerId)
+	ga.players[playerId].Position = target
+	ga.grid.CellAt(ga.players[playerId].Position).SetPlayer(playerId)
+	if ga.grid.CellAt(target).isItem() {
+		switch ga.grid.CellAt(target).getItemType() {
+		case itemExtraBomb:
+			ga.players[playerId].remainingBombs++
+		case itemExtraRange:
+			ga.players[playerId].bombRange++
+		}
+	}
+}
+
 func (ga GameArea) String() string {
 	var buffer bytes.Buffer
 	buffer.WriteString(fmt.Sprintf("%v", ga.grid))
@@ -414,61 +645,203 @@ func (ga GameArea) String() string {
 	buffer.WriteString(fmt.Sprintf("%v\n", ga.players))
 
 	return buffer.String()
+}
 
+func Diff(g1, g2 *GameArea) {
+	for y, line := range g1.grid {
+		for x, cell := range line {
+			pos := Position{x, y}
+			cell2 := *g2.grid.CellAt(pos)
+			if cell != cell2 && !cell.isPlayer() && !cell2.isPlayer() {
+				fmt.Fprintf(os.Stderr, "diff at %v: %v != %v\n", pos, cell, cell2)
+			}
+		}
+	}
+}
+
+func (ga *GameArea) NbTurnsSinceReference() int {
+	return ga.turn - turn
+}
+
+func (ga *GameArea) HasToBeTreatedBefore(ga2 *GameArea) bool {
+	s1, s2 := ga.players[me].scorePerTurn, ga2.players[me].scorePerTurn
+	if s1 != s2 {
+		return s1 > s2
+	}
+	p1, p2 := ga.players[me].potPerTurn, ga2.players[me].potPerTurn
+	if p1 != p2 {
+		return p1 > p2
+	}
+	return ga.turn < ga2.turn
+}
+
+var nbCritDead, nbCritSpt, nbCritPpt, nbCritTurn int
+
+func (ga *GameArea) IsBetterThan(ga2 *GameArea) bool {
+	if ga.players[me].isDead != ga2.players[me].isDead {
+		nbCritDead++
+		return !ga.players[me].isDead
+	}
+	s1, s2 := ga.players[me].scorePerTurn, ga2.players[me].scorePerTurn
+	if s1 != s2 {
+		nbCritSpt++
+		return s1 > s2
+	}
+	p1, p2 := ga.players[me].potPerTurn, ga2.players[me].potPerTurn
+	if p1 != p2 {
+		nbCritPpt++
+		return p1 > p2
+	}
+	nbCritTurn++
+	return ga.turn > ga2.turn
+}
+
+type genHeap []*GameArea
+
+func (h genHeap) Len() int            { return len(h) }
+func (h genHeap) Less(i, j int) bool  { return h[i].HasToBeTreatedBefore(h[j]) }
+func (h genHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *genHeap) Push(x interface{}) { *h = append(*h, x.(*GameArea)) }
+func (h *genHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
 var me int //index of me
+var timeout bool
+var begin time.Time
+var turn int
+var currentGameArea *GameArea
+var countBombExploded, countGeneratedStates int
 
 func main() {
 
 	var c Cell
 	i := 0
 
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.SetWall()
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.ResetWall()
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.SetBomb(2)
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.ResetBomb(2)
+	if false {
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.SetWall()
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.ResetWall()
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.SetBomb(2)
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.ResetBomb(2)
 
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.SetBox(1)
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.SetBox(1)
 
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.ResetBox()
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.SetPlayer(1)
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
-	c.ResetPlayer(1)
-	fmt.Fprintln(os.Stderr, i, c)
-	i++
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.ResetBox()
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.SetPlayer(1)
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+		c.ResetPlayer(1)
+		fmt.Fprintln(os.Stderr, i, c)
+		i++
+	}
 
 	var width, height int
 	fmt.Scan(&width, &height, &me)
-	var gameArea *GameArea = nil
 	var previous *GameArea = nil
 
 	for {
 
-		gameArea = new(GameArea)
+		runtime.GC()
+		nbCritDead, nbCritSpt, nbCritPpt, nbCritTurn = 0, 0, 0, 0
 
-		gameArea.acquire()
-		gameArea.previous = previous
+		currentGameArea = new(GameArea)
+		currentGameArea.previous = previous
+		currentGameArea.turn = turn
 
-		fmt.Fprint(os.Stderr, gameArea)
+		currentGameArea.acquire()
 
-		// fmt.Fprintln(os.Stderr, "Debug messages...")
-		fmt.Printf("BOMB %v %v\n", 5, 6) // Write action to stdout
-		previous = gameArea
+		timeout = false
+		begin = time.Now()
+
+		if previous != nil { // test explosion
+			var simulatedCurrentGA GameArea = *previous
+			simulatedCurrentGA.previous = previous
+			cells := simulatedCurrentGA.ExplodeTimedOutBombs()
+			Diff(currentGameArea, &simulatedCurrentGA)
+			fmt.Fprintf(os.Stderr, "Burned cells: %v\n", cells)
+			for i := 0; i < maxPlayers; i++ {
+				currentGameArea.players[i].score = simulatedCurrentGA.players[i].score
+			}
+		}
+
+		queue := make(genHeap, 0, 1000)
+		queue.Push(currentGameArea)
+		heap.Init(&queue)
+
+		bestGameArea := currentGameArea
+		turnStats := make(map[int]int)
+
+		count := 0
+
+		for len(queue) > 0 {
+			var currentGA *GameArea = heap.Pop(&queue).(*GameArea)
+			for _, state := range currentGA.GetNextStates(me) {
+				if !state.players[me].isDead {
+					heap.Push(&queue, state)
+					if state.IsBetterThan(bestGameArea) {
+						bestGameArea = state
+					}
+					turnStats[state.turn]++
+				}
+			}
+
+			count++
+			if count%100 == 0 {
+				elapsed := time.Since(begin)
+				//fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
+				if elapsed > timeoutLimit*time.Millisecond {
+					timeout = true
+					fmt.Fprintf(os.Stderr, "elapsed: %v\n", elapsed)
+				}
+			}
+
+			if timeout {
+				break
+			}
+		}
+
+		pathLen := 0
+
+		nextState := bestGameArea
+
+		if nextState != currentGameArea {
+			for nextState.previous != currentGameArea {
+				nextState = nextState.previous
+				pathLen++
+			}
+		}
+
+		fmt.Fprint(os.Stderr, currentGameArea)
+
+		fmt.Fprintf(os.Stderr, "PathLen=%v treated=%v remaining=%v\n", pathLen, count, len(queue))
+		fmt.Fprintf(os.Stderr, "crit d=%v spt=%v ppt=%v t=%v\n", nbCritDead, nbCritSpt, nbCritPpt, nbCritTurn)
+		fmt.Fprint(os.Stderr, bestGameArea)
+
+		for i := turn + 1; turnStats[i] > 0; i++ {
+			fmt.Fprintf(os.Stderr, "turn %v: %v\n", i, turnStats[i])
+		}
+
+		fmt.Printf("%v\n", nextState.actionToGetHere) // Write action to stdout
+
+		previous = currentGameArea
+		turn++
 	}
 }
