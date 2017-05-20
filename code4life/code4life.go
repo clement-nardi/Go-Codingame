@@ -329,6 +329,136 @@ func (s State) canCompleteInThisOrder(playerIdx int, sampleSet Samples) (bool, M
 	return true, needed
 }
 
+func (s Samples) String() string {
+	ids := make([]int, len(s))
+	for i, sample := range s {
+		ids[i] = sample.id
+	}
+	return fmt.Sprint(ids)
+}
+
+type Step struct {
+	completed Samples
+	needed    Molecules
+}
+
+type Steps []Step
+
+func (steps Steps) String() string {
+	var out string
+	for i, step := range steps {
+		out += fmt.Sprintf("step %v: %v needed=%v\n", i, step.completed, step.needed)
+	}
+	return out
+}
+
+func LowerOrEqual(a, b Molecules) bool {
+	for i := range a {
+		if a[i] > b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s State) bestCompleteInThisOrder(playerIdx int, sampleSet Samples) (steps Steps) {
+	p := s.players[playerIdx]
+	firstSampleIdx := 0
+	for {
+		var needed Molecules
+		var cost Molecules
+		var lastSampleIdx int
+		/* try to put as many samples as possible per step */
+		for lastSampleIdx = firstSampleIdx; lastSampleIdx < len(sampleSet); lastSampleIdx++ {
+			sample := sampleSet[lastSampleIdx]
+			newCost := Add(cost, Max(zero, Subtract(sample.cost, p.expertise)))
+			newNeeded := Max(zero, Subtract(newCost, p.storage))
+			if newNeeded.Sum()+p.storage.Sum() > maxHeldMolecules ||
+				!LowerOrEqual(newNeeded, s.available) {
+				fmt.Fprintf(os.Stderr, "Cannot add sample %v to step %v\n", lastSampleIdx, len(steps))
+				break
+			} else {
+				fmt.Fprintf(os.Stderr, "add sample %v to step %v\n", lastSampleIdx, len(steps))
+				needed = newNeeded
+				cost = newCost
+				p.expertise[sample.expertiseGain]++
+			}
+		}
+		fmt.Fprintf(os.Stderr, "firstSampleIdx=%v lastSampleIdx=%v\n", firstSampleIdx, lastSampleIdx)
+		if lastSampleIdx > firstSampleIdx {
+			fmt.Fprintf(os.Stderr, "create step %v\n", len(steps))
+			steps = append(steps, Step{sampleSet[firstSampleIdx:lastSampleIdx], needed})
+			firstSampleIdx = lastSampleIdx
+			p.storage = Add(p.storage, needed)
+			s.available = Subtract(s.available, needed)
+			p.storage = Subtract(p.storage, cost)
+			s.available = Add(s.available, cost)
+			/* try another step */
+		} else {
+			break
+		}
+	}
+	return
+}
+
+func (s State) StepsValue(playerIdx int, steps Steps) float64 {
+	p := s.players[playerIdx]
+	nbSamples := 0
+	gain := 0
+	cost := 0
+	for stepIdx, step := range steps {
+		for _, sample := range step.completed {
+			gain += sample.health + s.moleculeValuesForProjects(p)[sample.expertiseGain]
+			p.expertise[sample.expertiseGain]++
+			/* expertise contributes to future purchase */
+			switch p.expertise[sample.expertiseGain] {
+			case 1:
+				gain += 8
+			case 2:
+				gain += 6
+			case 3:
+				gain += 3
+			}
+		}
+		cost += step.needed.Sum()
+		if stepIdx > 0 {
+			/* round-trip laboratory<->molecules */
+			cost += 2 * distance(laboratory, molecules)
+		}
+	}
+
+	cost += distance(laboratory, samples)
+	cost += nbSamples
+	cost += distance(samples, diagnosis)
+	cost += nbSamples
+	cost += distance(diagnosis, molecules)
+
+	return float64(gain) / float64(cost)
+}
+
+func (s State) bestComplete(playerIdx int, sampleSet Samples) (bestSteps Steps) {
+	permut := makePermutation(len(sampleSet))
+	bestValue := 0.0
+	for {
+		samplePermut := permut.Reordered(sampleSet)
+		steps := s.bestCompleteInThisOrder(playerIdx, samplePermut)
+		for stepIdx := range steps {
+			subSteps := steps[:stepIdx+1]
+			value := s.StepsValue(playerIdx, subSteps)
+			fmt.Fprintf(os.Stderr, "%vvalue=%v\n", subSteps, value)
+			if value > bestValue {
+				bestSteps = subSteps
+				bestValue = value
+			}
+		}
+		if !permut.Next() {
+			break
+		}
+	}
+	fmt.Fprintf(os.Stderr, "best steps:\n%vbestValue=%v\n", bestSteps, bestValue)
+	return
+}
+
 func (m Molecules) MinValue() int {
 	min := m[0]
 	for i := 1; i < nbMolecules; i++ {
@@ -708,7 +838,6 @@ func main() {
 				if totalExpertiseBelowFour > 7 && me.nbRankHeld(3) == 0 ||
 					totalExpertiseBelowFour > 9 && me.nbRankHeld(3) <= 1 ||
 					totalExpertiseBelowFour > 11 {
-					/* allow 1 rank 3 */
 					rank = 3
 				}
 				Connect(rank)
@@ -732,8 +861,8 @@ func main() {
 						future.available = Add(future.available, currentState.CostInThisOrder(1, opponentCompleteSamples))
 					}
 				}
-				samples, _ := future.samplesThatCanBeCompleted(0)
-				if len(samples) == 0 {
+				steps := currentState.bestComplete(0, me.heldSamples)
+				if len(steps) == 0 {
 					/* dump samples */
 					Connect(me.heldSamples[0].id)
 					actionDone = true
@@ -749,16 +878,29 @@ func main() {
 			}
 		case molecules:
 			actionDone := false
+			oneIsComplete := false
 			if !actionDone {
-				samples, needed := currentState.samplesThatCanBeCompleted(0)
-				fmt.Fprintf(os.Stderr, "can be completed: %v\nneeded: %v\n", samples, needed)
-				if len(samples) > 0 {
-					m, _ := currentState.moleculeToPickFirst(needed)
-					Gather(m)
-					actionDone = true
+				steps := currentState.bestComplete(0, me.heldSamples)
+				var cumulNeeded Molecules
+				for i, step := range steps {
+					cumulNeeded = Add(cumulNeeded, step.needed)
+					if cumulNeeded.Sum() == 0 {
+						fmt.Fprintf(os.Stderr, "step %v is complete\n", i)
+						oneIsComplete = true
+					} else {
+						m, _ := currentState.moleculeToPickFirst(cumulNeeded)
+						if m >= 0 {
+							fmt.Fprintf(os.Stderr, "gather molecule for step %v\n", i)
+							Gather(m)
+							actionDone = true
+						} else {
+							fmt.Fprintf(os.Stderr, "CAN'T gather molecule for step %v\n", i)
+						}
+						break
+					}
 				}
 			}
-			if !actionDone && len(currentState.completeSamples(0)) > 0 {
+			if !actionDone && oneIsComplete {
 				GoTo(laboratory)
 				actionDone = true
 			}
