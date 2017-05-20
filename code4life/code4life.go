@@ -149,14 +149,17 @@ func (a Samples) Less(i, j int) bool {
 }
 
 func GoTo(m Module) {
+	fmt.Fprintf(os.Stderr, "GOTO %v\n", moduleNames[m])
 	fmt.Printf("GOTO %v\n", moduleNames[m])
 }
 
 func Connect(sampleId int) {
+	fmt.Fprintf(os.Stderr, "CONNECT %v\n", sampleId)
 	fmt.Printf("CONNECT %v\n", sampleId)
 }
 
 func Gather(moleculeIdx int) {
+	fmt.Fprintf(os.Stderr, "CONNECT %c\n", moleculeType(moleculeIdx))
 	fmt.Printf("CONNECT %c\n", moleculeType(moleculeIdx))
 }
 
@@ -762,6 +765,17 @@ func (s State) moleculeValuesForProjects(player Player) (value Molecules) {
 	return
 }
 
+func (sample *Sample) isInSteps(steps Steps) bool {
+	for _, step := range steps {
+		for _, s := range step.completed {
+			if s.id == sample.id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 /**
  * Bring data on patient samples from the diagnosis machine to the laboratory with enough molecules to produce medicine!
  **/
@@ -826,6 +840,7 @@ func main() {
 		case startingPosition:
 			GoTo(samples)
 		case samples:
+			fmt.Fprintf(os.Stderr, "samples\n")
 			nbHeld := len(me.heldSamples)
 			if nbHeld < maxHeldSamples {
 				rank := 1
@@ -845,6 +860,7 @@ func main() {
 				GoTo(diagnosis)
 			}
 		case diagnosis:
+			fmt.Fprintf(os.Stderr, "diagnosis\n")
 			actionDone := false
 			for _, sample := range me.heldSamples {
 				if !sample.IsDiagnosed() {
@@ -862,10 +878,13 @@ func main() {
 					}
 				}
 				steps := currentState.bestComplete(0, me.heldSamples)
-				if len(steps) == 0 {
-					/* dump samples */
-					Connect(me.heldSamples[0].id)
-					actionDone = true
+				for _, sample := range me.heldSamples {
+					if !sample.isInSteps(steps) {
+						/* dump samples */
+						Connect(me.heldSamples[0].id)
+						actionDone = true
+						break
+					}
 				}
 			}
 			if !actionDone && len(me.heldSamples) == 0 {
@@ -877,6 +896,7 @@ func main() {
 				GoTo(molecules)
 			}
 		case molecules:
+			fmt.Fprintf(os.Stderr, "molecules\n")
 			actionDone := false
 			oneIsComplete := false
 			if !actionDone {
@@ -930,23 +950,27 @@ func main() {
 				}
 			}
 		case laboratory:
+			fmt.Fprintf(os.Stderr, "laboratory\n")
 			actionDone := false
 			if !actionDone {
+				fmt.Fprintf(os.Stderr, "complete?\n")
 				sampleSet := currentState.completeSamples(0)
 				if len(sampleSet) > 0 {
+					fmt.Fprintf(os.Stderr, "connect %v!", sampleSet[0].id)
 					Connect(sampleSet[0].id)
 					actionDone = true
 				}
 			}
 			if !actionDone {
+				fmt.Fprintf(os.Stderr, "can complete?\n")
 				sampleSet, _ := currentState.samplesThatCanBeCompleted(0)
 				if len(sampleSet) > 0 {
 					GoTo(molecules)
 					actionDone = true
-					break
 				}
 			}
 			if !actionDone {
+				fmt.Fprintf(os.Stderr, "goto samp\n")
 				GoTo(samples)
 			}
 		}
