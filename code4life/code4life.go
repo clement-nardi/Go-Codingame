@@ -168,6 +168,7 @@ type State struct {
 	available         Molecules
 	currentSamples    Samples
 	availableProjects []Molecules
+	previous          *State
 }
 
 func (s State) Me() Player {
@@ -776,6 +777,20 @@ func (sample *Sample) isInSteps(steps Steps) bool {
 	return false
 }
 
+func (state State) PlayerIsWaiting(playerIdx int) bool {
+	if state.previous != nil {
+		p := state.players[playerIdx]
+		pp := state.previous.players[playerIdx]
+		if pp.target == p.target &&
+			pp.eta == p.eta &&
+			len(pp.heldSamples) == len(p.heldSamples) &&
+			pp.storage.Sum() == p.storage.Sum() {
+			return true
+		}
+	}
+	return false
+}
+
 /**
  * Bring data on patient samples from the diagnosis machine to the laboratory with enough molecules to produce medicine!
  **/
@@ -825,10 +840,14 @@ func main() {
 	for i := 0; i < projectCount; i++ {
 		scienceProjects[i].Acquire()
 	}
+
+	var previousState *State = nil
+
 	for {
 
-		var currentState State
+		var currentState *State = new(State)
 		currentState.Acquire()
+		currentState.previous = previousState
 
 		var me Player = currentState.Me()
 
@@ -851,8 +870,8 @@ func main() {
 					rank = 2
 				}
 				if totalExpertiseBelowFour > 7 && me.nbRankHeld(3) == 0 ||
-					totalExpertiseBelowFour > 9 && me.nbRankHeld(3) <= 1 ||
-					totalExpertiseBelowFour > 11 {
+					totalExpertiseBelowFour > 10 && me.nbRankHeld(3) <= 1 ||
+					totalExpertiseBelowFour > 12 {
 					rank = 3
 				}
 				Connect(rank)
@@ -877,7 +896,7 @@ func main() {
 						future.available = Add(future.available, currentState.CostInThisOrder(1, opponentCompleteSamples))
 					}
 				}
-				steps := currentState.bestComplete(0, me.heldSamples)
+				steps := future.bestComplete(0, me.heldSamples)
 				for _, sample := range me.heldSamples {
 					if !sample.isInSteps(steps) {
 						/* dump samples */
@@ -928,17 +947,32 @@ func main() {
 				opponentCompleteSamples := currentState.completeSamples(1)
 				if len(opponentCompleteSamples) > 0 {
 					/* opponent is going to the laboratory with one or more complete samples */
-					future := currentState
+					future := *currentState
 					future.available = Add(future.available, currentState.CostInThisOrder(1, opponentCompleteSamples))
-					futureSamplesToComplete, needed := future.samplesThatCanBeCompleted(0)
-					if len(futureSamplesToComplete) > 0 {
-						pick, _ := currentState.moleculeToPickFirst(needed)
-						if pick >= 0 {
-							Gather(pick)
+					futureSteps := future.bestComplete(0, me.heldSamples)
+
+					var cumulNeeded Molecules
+
+					for i, step := range futureSteps {
+						cumulNeeded = Add(cumulNeeded, step.needed)
+						fmt.Fprintln(os.Stderr, currentState.available)
+						fmt.Fprintln(os.Stderr, cumulNeeded)
+						m, _ := currentState.moleculeToPickFirst(cumulNeeded)
+						if m >= 0 {
+							fmt.Fprintf(os.Stderr, "future: gather molecule for step %v\n", i)
+							Gather(m)
+							actionDone = true
 						} else {
-							fmt.Println("WAIT")
+							fmt.Fprintf(os.Stderr, "future: CAN'T gather molecule for step %v\n", i)
 						}
-						actionDone = true
+						break
+					}
+					if len(futureSteps) > 0 && !actionDone {
+						/* TODO: detect opponent that waits at the laboratory */
+						if !currentState.PlayerIsWaiting(1) {
+							fmt.Println("WAIT")
+							actionDone = true
+						}
 					}
 				}
 			}
@@ -970,9 +1004,9 @@ func main() {
 				}
 			}
 			if !actionDone {
-				fmt.Fprintf(os.Stderr, "goto samp\n")
 				GoTo(samples)
 			}
 		}
+		previousState = currentState
 	}
 }
